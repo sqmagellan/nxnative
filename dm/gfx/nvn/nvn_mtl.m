@@ -7344,12 +7344,28 @@ static NSString *lib_digest(const void *p, size_t n) {
 // Metal retains a library's input data while its functions live. Borrowing a file mapping here therefore kept one mapping per distinct library for the run, consuming room
 // in #2965's restricted iOS task map even with prewarm off. Give Metal owned bytes, then unmap before calling it. Both loose files and image entries follow this ownership rule.
 // Owned data can use malloc's existing arenas when new file mappings have no gap; the tradeoff is charged memory instead of reclaimable file pages.
+// The Mac has no such task map and borrows the mapping: Metal's data releases it in its destructor. The copy charged Ocarina of Time (Switch 2) 1.3 GB of malloc on an M4
+// (39,776 blocks; MALLOC_SMALL 1,956 MB copied against 486 MB borrowed), dirty memory where the file's clean pages can be dropped under pressure. DM_MSL_LIB_COPY=1 copies on
+// the Mac too, =0 borrows on iOS.
 // The descriptor is closed promptly too: newLibraryWithURL keeps one open per library and exceeded iOS's soft limit of 256. The digest still names the original library bytes.
+static _Atomic int g_lib_borrow = -1;
+static int lib_borrow(void) {
+    int b = g_lib_borrow;
+    if (b < 0) { const char *e = getenv("DM_MSL_LIB_COPY"); b = e && *e ? *e == '0' : TARGET_OS_OSX; g_lib_borrow = b; }
+    return b;
+}
 static id<MTLLibrary> lib_from_map(msl_map f, NSError **err) {
     size_t sz = f.size;
     NSString *tag = lib_digest(f.data, sz);
-    dispatch_data_t d = dispatch_data_create(f.data, sz, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-    munmap(f.base, f.base_len);
+    dispatch_data_t d;
+    if (lib_borrow()) {
+        void *base = f.base; size_t base_len = f.base_len;
+        d = dispatch_data_create(f.data, sz, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(base, base_len); });
+        if (!d) munmap(base, base_len);
+    } else {
+        d = dispatch_data_create(f.data, sz, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        munmap(f.base, f.base_len);
+    }
     if (!d) {
         atomic_fetch_add_explicit(&g_lib_data_fails, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_lib_data_fail_bytes, (uint64_t)sz, memory_order_relaxed);
